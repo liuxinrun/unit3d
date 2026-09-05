@@ -5,6 +5,9 @@ from .unified_criterion import ScanNetUnifiedCriterion
 from .PositionEmbeddingCoords import PositionEmbeddingCoordsSine
 from .spconv_unet import SpConvUNet
 from .encoder import UniDet3DEncoder,QueryDecoder, Instance_relative_Decoder
+from .criterion import (BboxCostJointTraining, BOXMASKClassificationCost,
+                        MaskBCECost, MaskDiceCost, SegDetCriterionAlign,
+                        UniMatcher)
 from .loading import LoadAnnotations3D_, NormalizePointsColor_, DenormalizePointsColor
 from .formatting import Pack3DDetInputs_
 from .transforms_3d import PointDetClassMappingScanNet

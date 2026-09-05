@@ -66,12 +66,8 @@ class UNIT3D(UniDet3D):
                  bbox_by_mask, 
                  target_by_distance,
                  fast_nms,
-                 vis_attn=False,
                  with_normals=False,
                  minus_mean=False,
-                 use_pos_RPE=False,
-                 use_gblobs_emb=False,
-                 use_ray_loss=False,
                  get_sempan=True,
                  use_sync_bn=True,
                  backbone=None,
@@ -102,11 +98,8 @@ class UNIT3D(UniDet3D):
         self.use_sync_bn = use_sync_bn
         self.fast_nms = fast_nms
         self.get_sempan=get_sempan
-        self.use_pos_PRE=use_pos_RPE
-        self.use_gblobs_emb=use_gblobs_emb
         self.minus_mean=minus_mean
         self.with_normals=with_normals
-        self.vis_attn=vis_attn
         self._init_layers(in_channels, num_channels)
         
         
@@ -156,24 +149,16 @@ class UNIT3D(UniDet3D):
         queries = []
         sp_centers = []
         updated_instances = []
-        query_perc=0.5
-        
         for i in range(len(x)):
             updated_instance = copy.deepcopy(gt_instances[i])
-            if query_perc<1:
-                n = (1 - self.query_thr_seg) * torch.rand(1) + self.query_thr_seg
-                n = (n * len(x[i])).int()
-                ids = torch.randperm(len(x[i]))[:n].to(x[i].device)
-                
-                queries.append(x[i][ids])
-                sp_centers.append(gt_instances[i].sp_centers[ids])
-                updated_instance.sp_centers = updated_instance.sp_centers[ids]
-                updated_instance.query_masks = updated_instance.sp_masks[:, ids]
-                
-            else:
-                queries.append(x[i])
-                sp_centers.append(gt_instances[i].sp_centers)
-                updated_instance.query_masks = updated_instance.sp_masks
+            fraction = ((1 - self.query_thr_seg) * torch.rand(1)
+                        + self.query_thr_seg)
+            n = min(int((fraction * len(x[i])).item()), self.query_thr_det)
+            ids = torch.randperm(len(x[i]), device=x[i].device)[:n]
+            queries.append(x[i][ids])
+            sp_centers.append(gt_instances[i].sp_centers[ids])
+            updated_instance.sp_centers = updated_instance.sp_centers[ids]
+            updated_instance.query_masks = updated_instance.sp_masks[:, ids]
             updated_instances.append(updated_instance)
         return queries, sp_centers, updated_instances
 
@@ -198,8 +183,10 @@ class UNIT3D(UniDet3D):
                 - spatial_shape (Tensor): The spatial shape of the sparse tensor,
                 clipped to the minimum spatial shape.
         """
-        for i in range(len(points)):
-            points[i]=torch.cat([points[i],normals[i]],dim=1)
+        points = [
+            torch.cat([point, normal.to(point.device)], dim=1)
+            for point, normal in zip(points, normals)
+        ]
         if elastic_points is None:
             coordinates, features = ME.utils.batch_sparse_collate(
                 [((p[:, :3] - p[:, :3].min(0)[0]) / self.voxel_size,
@@ -222,18 +209,27 @@ class UNIT3D(UniDet3D):
         return coordinates, features, inverse_mapping, spatial_shape
 
     def get_points_and_shifts(self, batch_inputs_dict):
-        if batch_inputs_dict.get('elastic_coords') is not None:
-            points = [(point - point.min(0)[0]) * self.voxel_size for point in \
-                batch_inputs_dict['elastic_coords']]
-
-            shifts = [point.min(0)[0] * self.voxel_size for point in \
-                batch_inputs_dict['elastic_coords']]
+        elastic_coords = batch_inputs_dict.get('elastic_coords')
+        if self.minus_mean:
+            if elastic_coords is not None:
+                points = [(point - point.mean(0)) * self.voxel_size
+                          for point in elastic_coords]
+            else:
+                points = [point[:, :3] - point[:, :3].mean(0)
+                          for point in batch_inputs_dict['points']]
+            shifts = [point[:, :3].mean(0)
+                      for point in batch_inputs_dict['points']]
         else:
-            points = [point[:, :3] - point[:, :3].min(0)[0] for point in \
-                batch_inputs_dict['points']]
-        
-            shifts = [point[:, :3].min(0)[0] for point in \
-                batch_inputs_dict['points']]
+            if elastic_coords is not None:
+                points = [(point - point.min(0)[0]) * self.voxel_size
+                          for point in elastic_coords]
+                shifts = [point.min(0)[0] * self.voxel_size
+                          for point in elastic_coords]
+            else:
+                points = [point[:, :3] - point[:, :3].min(0)[0]
+                          for point in batch_inputs_dict['points']]
+                shifts = [point[:, :3].min(0)[0]
+                          for point in batch_inputs_dict['points']]
         return points, shifts
     def get_bboxes_by_masks(self, masks, points):
         """Generate 3D bounding boxes from masks.
@@ -260,6 +256,7 @@ class UNIT3D(UniDet3D):
             if not mask.any():
                 box = torch.zeros(6, device=mask.device)
                 boxes.append(box)
+                xyz_means.append(torch.zeros(3, device=mask.device))
                 continue
             object_points = points[mask]
             xyz_min = object_points.min(dim=0).values
@@ -274,6 +271,7 @@ class UNIT3D(UniDet3D):
             bboxes = DepthInstance3DBoxes(
                 masks.new_zeros(0, 6), with_yaw=False, 
                 box_dim=6, origin=(0.5, 0.5, 0.5))
+            xyz_means = points.new_zeros((0, 3))
         else:
             boxes = torch.stack(boxes)
             bboxes = DepthInstance3DBoxes(
@@ -300,28 +298,20 @@ class UNIT3D(UniDet3D):
         sp_pts_masks = []
         sp_centers = []
         
-        if batch_inputs_dict.get('elastic_coords') is not None:
-            points = [(point - point.min(0)[0]) * self.voxel_size for point in \
-                batch_inputs_dict['elastic_coords']]
-            shifts = [point.min(0)[0] * self.voxel_size for point in \
-                batch_inputs_dict['elastic_coords']]
-        else:
-            points = [point[:, :3] - point[:, :3].min(0)[0] for point in \
-                batch_inputs_dict['points']]
-            shifts = [point[:, :3].min(0)[0] for point in \
-                batch_inputs_dict['points']]
-
+        points, shifts = self.get_points_and_shifts(batch_inputs_dict)
         datasets_names = []
+        ori_sp_pts_masks = []
         for i in range(len(batch_data_samples)):
             datasets_names.append(self.get_dataset(
                             batch_data_samples[i].lidar_path))
             gt_pts_seg = batch_data_samples[i].gt_pts_seg
-            dataset = self.decoder.datasets.index(datasets_names[i])
+            ori_sp_pts_masks.append(copy.deepcopy(gt_pts_seg.sp_pts_mask))
+            dataset = self.datasets.index(datasets_names[i])
             if self.bbox_by_mask[dataset]:
                 gt_masks = self.get_gt_inst_masks(gt_pts_seg.pts_instance_mask)
-                batch_data_samples[i].gt_instances_3d.bboxes_3d = \
-                                            self.get_bboxes_by_masks(gt_masks.T,
-                                                                    points[i])
+                bboxes, xyz_mean = self.get_bboxes_by_masks(gt_masks.T, points[i])
+                batch_data_samples[i].gt_instances_3d.bboxes_3d = bboxes
+                batch_data_samples[i].gt_instances_3d.xyz_mean = xyz_mean
             else:
                 center = batch_data_samples[i].gt_instances_3d.\
                                     bboxes_3d.gravity_center - \
@@ -339,13 +329,13 @@ class UNIT3D(UniDet3D):
             
             batch_data_samples[i].gt_instances_3d.sp_centers = \
                 scatter_mean(points[i], gt_pts_seg.sp_pts_mask, dim=0)
-            if self.target_by_distance[dataset]:
+            if (self.target_by_distance[dataset]
+                    and len(batch_data_samples[i].gt_instances_3d.bboxes_3d) > 0):
                 batch_data_samples[i].gt_instances_3d.sp_masks = \
-                    self.get_targets(batch_data_samples[i].gt_instances_3d.\
-                                        sp_centers,
-                                     batch_data_samples[i].gt_instances_3d.\
-                                        bboxes_3d,
-                                     self.train_cfg.topk)
+                    self.get_targets(
+                        batch_data_samples[i].gt_instances_3d.sp_centers,
+                        batch_data_samples[i].gt_instances_3d.bboxes_3d,
+                        self.train_cfg.topk)
             sp_centers.append(batch_data_samples[i].gt_instances_3d.sp_centers)
             gt_pts_seg.sp_pts_mask += superpoint_bias
             superpoint_bias = gt_pts_seg.sp_pts_mask.max().item() + 1
@@ -354,9 +344,17 @@ class UNIT3D(UniDet3D):
             sp_gt_instances.append(batch_data_samples[i].gt_instances_3d)
             sp_pts_masks.append(gt_pts_seg.sp_pts_mask)
 
-        coordinates, features, inverse_mapping, spatial_shape = self.collate(
-            batch_inputs_dict['points'],
-            batch_inputs_dict.get('elastic_coords', None))
+        if self.with_normals:
+            normals = [sample.gt_instances.normals
+                       for sample in batch_data_samples]
+            coordinates, features, inverse_mapping, spatial_shape = \
+                self.collate_with_normals(
+                    batch_inputs_dict['points'],
+                    batch_inputs_dict.get('elastic_coords'), normals)
+        else:
+            coordinates, features, inverse_mapping, spatial_shape = self.collate(
+                batch_inputs_dict['points'],
+                batch_inputs_dict.get('elastic_coords'))
 
         x = spconv.SparseConvTensor(
             features, coordinates, spatial_shape, len(batch_data_samples))
@@ -364,10 +362,15 @@ class UNIT3D(UniDet3D):
         x = self.extract_feat(
             x, sp_pts_masks, inverse_mapping, batch_offsets)
         
+        ori_sp_centers = [instance.sp_centers for instance in sp_gt_instances]
         queries, sp_centers_queries, sp_gt_instances = \
                     self._select_queries(x, sp_gt_instances)
-        x = self.decoder(queries, sp_centers_queries, datasets_names)
-        loss = self.criterion(x, sp_gt_instances, datasets_names)
+        for instance, centers in zip(sp_gt_instances, ori_sp_centers):
+            instance.ori_sp_centers = centers
+        x_seg, x_det = self.decoder(x, queries, sp_centers_queries)
+        loss = self.criterion(
+            x_seg, x_det, sp_gt_instances, datasets_names,
+            ori_sp_pts_masks, points)
 
         return loss
 
@@ -404,15 +407,11 @@ class UNIT3D(UniDet3D):
         datasets_names = []
         sp_pts_masks_src = []
         points_src = []
-        ori_sp_pts_masks = []
 
-
-        
         for i in range(len(batch_data_samples)):
             datasets_names.append(self.get_dataset(
                             batch_data_samples[i].lidar_path))
             gt_pts_seg = batch_data_samples[i].gt_pts_seg
-            ori_sp_pts_masks.append(copy.deepcopy(gt_pts_seg.sp_pts_mask))
             points = batch_inputs_dict['points'][i][:, :3]
 
             points_src.append(points)
@@ -442,6 +441,9 @@ class UNIT3D(UniDet3D):
                 x, sp_pts_masks, inverse_mapping, batch_offsets)
 
         x_seg,x_det= self.decoder(x, x, sp_centers)
+        results_list = self.predict_by_feat_seg_det(
+            x_seg, x_det, sp_pts_masks_src, sp_pts_masks,
+            points_src, datasets_names, self.get_sempan)
         if self.get_sempan:
             for i, data_sample in enumerate(batch_data_samples):
                 bboxes, labels, scores = results_list[i]['det']
@@ -455,14 +457,9 @@ class UNIT3D(UniDet3D):
                     pts_instance_mask=pts_instance_mask,
                     mask_instance_labels=res_mask[1].cpu().numpy(),
                     mask_instance_scores=res_mask[2].cpu().numpy())
-                if self.vis_attn:
-                    data_sample.pred_instances_3d = InstanceData_(
-                    bboxes_3d=bboxes, scores_3d=scores, labels_3d=labels,points_attn=attn_weight_points,
-                    points=batch_inputs_dict['points'][0])
-                else:
-                    data_sample.pred_instances_3d = InstanceData_(
-                        bboxes_3d=bboxes, scores_3d=scores, labels_3d=labels,
-                        points=batch_inputs_dict['points'][0])
+                data_sample.pred_instances_3d = InstanceData_(
+                    bboxes_3d=bboxes, scores_3d=scores, labels_3d=labels,
+                    points=batch_inputs_dict['points'][i])
         else:
             for i, data_sample in enumerate(batch_data_samples):
                 bboxes, labels, scores = results_list[i]['det']
@@ -475,7 +472,7 @@ class UNIT3D(UniDet3D):
                     mask_instance_scores=res_mask[2].cpu().numpy())
                 data_sample.pred_instances_3d = InstanceData_(
                     bboxes_3d=bboxes, scores_3d=scores, labels_3d=labels,
-                    points=batch_inputs_dict['points'][0])
+                    points=batch_inputs_dict['points'][i])
 
         
             
@@ -857,7 +854,4 @@ def mask_matrix_nms(masks,
     labels = labels[sort_inds]
 
     return scores, labels, masks, keep_inds
-
-
-
 

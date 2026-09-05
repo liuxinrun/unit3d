@@ -15,10 +15,6 @@ import torch.nn.functional as F
 import MinkowskiEngine as ME
 import functools
 import math
-from .blocks_spherical_mask import MLP, GenericMLP, ResidualBlock, UBlock, conv_with_kaiming_uniform
-from .spherical_mask_model_utils import get_instance_info_dyco_ray,get_cropped_instance_label,get_batch_offsets,\
-get_spp_gt_ray
-from .maskboxRPE import MaskPredictorWithBoxRPE
 class CrossAttentionLayer(BaseModule):
     """Cross attention layer.
 
@@ -727,8 +723,8 @@ class Instance_relative_Decoder(QueryDecoder):
         pred_bboxes.append(pred_bbox)
         num_channels = self.d_model if self.pos_type=='sine' else None
         if self.pos_normlize:
-            pbmin = torch.stack([bbox[:,:3].min(0)[0] for bbox in pred_bbox])  
-            pbmax = torch.stack([bbox[:,:3].max(0)[0] for bbox in pred_bbox])  
+            pbmin = [bbox[:, :3].min(0)[0].unsqueeze(0) for bbox in pred_bbox]
+            pbmax = [bbox[:, :3].max(0)[0].unsqueeze(0) for bbox in pred_bbox]
             q_pos=[self.pos_emb(pred_bbox[k][:,:3].unsqueeze(0),num_channels=num_channels,input_range=(pbmin[k],pbmax[k])).transpose(1, 2).squeeze(0) for k in range(len(queries))]
         else:
             q_pos=[self.pos_emb(pred_bbox[k][:,:3].unsqueeze(0),num_channels=num_channels).transpose(1, 2).squeeze(0) for k in range(len(queries))]
