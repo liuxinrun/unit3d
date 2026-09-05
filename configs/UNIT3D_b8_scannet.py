@@ -1,5 +1,5 @@
 _base_ = ['mmdet3d::_base_/default_runtime.py']
-custom_imports = dict(imports=['unidet3d'])
+custom_imports = dict(imports=['unit3d'])
 import math
 
 classes_scannet = ['cabinet', 'bed', 'chair', 'sofa', 'table', 'door', 'window', 'bookshelf',
@@ -24,11 +24,7 @@ classes_arkitscenes = ['cabinet', 'refrigerator', 'shelf', 'stove', 'bed',
                         'sink', 'washer', 'toilet', 'bathtub', 'oven',
                         'dishwasher', 'fireplace', 'stool', 'chair', 'table',
                         'tv_monitor', 'sofa']
-score_thr=0.0
-vis=False
-vis_dir='vis' if vis else None
-if vis_dir is not None:
-    score_thr = 0.5
+score_thr = 0.0
 # model settings
 num_channels=32
 voxel_size=0.02
@@ -120,7 +116,6 @@ model = dict(
             topk=[1],
             fix_dice_loss_weight=False,
             iter_matcher=True,
-            use_lm2b=False,
             fix_mean_loss=True)),
     train_cfg=dict(topk=1),
     test_cfg=dict(
